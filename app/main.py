@@ -57,7 +57,7 @@ async def slack_events(request: Request):
         return PlainTextResponse(str(payload.get("challenge") or ""), status_code=200)
 
     # Ack immediately; process async
-    asyncio.create_task(handle_slack_events(payload, services))
+    asyncio.create_task(handle_slack_events(payload, get_services()))
     return JSONResponse({"ok": True})
 
 
@@ -77,7 +77,7 @@ async def slack_actions(request: Request):
         raise HTTPException(status_code=400, detail="invalid payload json")
 
     # Ack immediately; process async
-    asyncio.create_task(handle_slack_actions(payload, services))
+    asyncio.create_task(handle_slack_actions(payload, get_services()))
     return JSONResponse({"ok": True})
 
 
@@ -86,7 +86,7 @@ async def notify_planned(request: Request):
     _verify_jobs_token(request)
 
     # Ack can wait; this endpoint is called by scheduler
-    res = await services.notify_planned()
+    res = await get_services().notify_planned()
     return JSONResponse(res)
 
 

@@ -57,7 +57,14 @@ async def slack_events(request: Request):
         return PlainTextResponse(str(payload.get("challenge") or ""), status_code=200)
 
     # Ack immediately; process async
-    asyncio.create_task(handle_slack_events(payload, get_services()))
+    event = payload.get("event", {})
+    if event.get("type") == "message" and event.get("thread_ts"):
+        asyncio.create_task(
+            get_services().process_slack_thread_message(
+                thread_ts=event["thread_ts"],
+                text=event.get("text", "")
+            )
+        )
     return JSONResponse({"ok": True})
 
 
@@ -77,7 +84,19 @@ async def slack_actions(request: Request):
         raise HTTPException(status_code=400, detail="invalid payload json")
 
     # Ack immediately; process async
-    asyncio.create_task(handle_slack_actions(payload, get_services()))
+    action = payload["actions"][0]
+
+    normalized_action = {
+        "action_id": action.get("action_id"),
+        "value": action.get("value"),
+        "channel_id": payload.get("channel", {}).get("id"),
+        "message_ts": payload.get("message", {}).get("ts"),
+    }
+
+    asyncio.create_task(
+        get_services().process_slack_action(normalized_action)
+    )
+
     return JSONResponse({"ok": True})
 
 
@@ -97,6 +116,8 @@ def _verify_jobs_token(request: Request) -> None:
 
 
 def _verify_slack_request(request: Request, body: bytes) -> None:
+    if request.headers.get("X-Slack-Retry-Num"):
+        raise HTTPException(status_code=200, detail="retry ignored")
     timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
     signature = request.headers.get("X-Slack-Signature", "")
     try:

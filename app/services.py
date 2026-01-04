@@ -174,7 +174,9 @@ class Services:
 
             # run outline generation async
             import asyncio
-            asyncio.create_task(self.generate_outline(article_id=article_id))
+            # ARTICLE_START 直後
+            await self.generate_outline(article_id=article_id)
+
 
         except Exception as e:
             logger.exception("start_article failed")

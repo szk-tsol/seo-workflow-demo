@@ -867,12 +867,14 @@ class Services:
         thread_ts: Optional[str] = None,
     ) -> None:
         await anyio.to_thread.run_sync(
-            self.slack.post_message,
-            channel=channel,
-            text=text,
-            blocks=blocks,
-            thread_ts=thread_ts,
+            lambda: self.slack.post_message(
+                channel=channel,
+                text=text,
+                blocks=blocks,
+                thread_ts=thread_ts,
+            )
         )
+
 
     def _find_selected_candidate(self, candidates: List[Dict[str, Any]], pmid: Optional[str]) -> Optional[Dict[str, Any]]:
         if not pmid:

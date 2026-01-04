@@ -868,14 +868,20 @@ class Services:
         blocks: Optional[List[Dict[str, Any]]],
         thread_ts: Optional[str] = None,
     ) -> None:
-        await anyio.to_thread.run_sync(
-            lambda: self.slack.post_message(
-                channel=channel,
-                text=text,
-                blocks=blocks,
-                thread_ts=thread_ts,
-            )
-        )
+        def _post():
+            kwargs = {
+                "channel": channel,
+                "text": text,
+            }
+            if blocks is not None:
+                kwargs["blocks"] = blocks
+            if thread_ts is not None:
+                kwargs["thread_ts"] = thread_ts
+
+            return self.slack.post_message(**kwargs)
+
+        await anyio.to_thread.run_sync(_post)
+
 
 
     def _find_selected_candidate(self, candidates: List[Dict[str, Any]], pmid: Optional[str]) -> Optional[Dict[str, Any]]:

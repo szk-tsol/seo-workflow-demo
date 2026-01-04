@@ -20,7 +20,10 @@ init_logging()
 logger = get_logger(__name__)
 
 settings = get_settings()
-services = Services(settings)
+
+def get_services() -> Services:
+    return Services(settings)
+
 
 app = FastAPI(title="seo-workflow")
 

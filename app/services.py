@@ -209,15 +209,17 @@ class Services:
             )
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={
-                    "outline_text": outline,
-                    "outline_feedback_text": None,
-                    "slack_revision_thread_ts": None,
-                },
-                set_phase=Phase.OUTLINE_REVIEW,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={
+                        "outline_text": outline,
+                        "outline_feedback_text": None,
+                        "slack_revision_thread_ts": None,
+                    },
+                    set_phase=Phase.OUTLINE_REVIEW,
+                )
             )
+
 
             blocks = self.ui.outline_review_blocks(article_id=state.article_id, keyword=state.keyword, outline_text=outline)
             await self._slack_post(

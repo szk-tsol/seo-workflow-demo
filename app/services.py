@@ -68,7 +68,15 @@ class Services:
         action_id: str = str(action.get("action_id") or "").strip()
         channel_id: str = str(action.get("channel_id") or "").strip()
         message_ts: str = str(action.get("message_ts") or "").strip()
-        value: Dict[str, Any] = dict(action.get("value") or {})
+
+        raw_value = action.get("value")
+        value: Dict[str, Any] = {}
+        if isinstance(raw_value, str):
+            try:
+                value = json.loads(raw_value)
+            except Exception:
+                value = {}
+
 
         if action_id == "ARTICLE_START":
             keyword = str(value.get("keyword") or "").strip()

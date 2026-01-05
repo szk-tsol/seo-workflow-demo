@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,21 +16,21 @@ from app.integrations.slack.ui import SlackUI
 from app.storage.firestore import FirestoreRepo
 from app.storage.sheets import SheetsClient, PlannedRow
 from app.utils.errors import (
-    AppError,
-    ExternalApiError,
-    SlackApiError,
-    PubMedNoResultsError,
-    PubMedTooManyResultsError,
-    OpenAIError,
-    WordPressError,
+AppError,
+ExternalApiError,
+SlackApiError,
+PubMedNoResultsError,
+PubMedTooManyResultsError,
+OpenAIError,
+WordPressError,
 )
 from app.utils.time import (
-    now_jst_iso,
-    add_days_jst_iso,
-    is_expired,
-    today_jst_ymd,
-    normalize_ymd,
-    generate_article_id,
+now_jst_iso,
+add_days_jst_iso,
+is_expired,
+today_jst_ymd,
+normalize_ymd,
+generate_article_id,
 )
 from app.utils.logger import get_logger
 
@@ -37,6 +38,8 @@ logger = get_logger(__name__)
 
 
 class Services:
+
+
     def __init__(self, settings: Settings):
         self.settings = settings
 
@@ -44,95 +47,130 @@ class Services:
         self.sheets = SheetsClient(settings)
 
         self.slack = SlackClient(settings)
-        self.ui = SlackUI()
+        self.ui = SlackUI(settings)
 
         self.openai = OpenAIClient(settings)
         self.pubmed = PubMedClient(settings)
         self.wp = WordPressClient(settings)
 
+    # -------------------------
+    # Cron/Jobs entrypoint
+    # -------------------------
     async def notify_planned(self) -> Dict[str, Any]:
+        """
+        Pull today's planned keywords from Google Sheets.
+        Notify Slack with buttons "作成する / スキップ".
+        """
         rows = await anyio.to_thread.run_sync(self.sheets.planned_for_today)
-        planned: List[Dict[str, str]] = []
+        ymd = today_jst_ymd()
+        planned: List[Dict[str, Any]] = []
         for r in rows:
             planned.append({"keyword": r.keyword, "planned_date": r.planned_date})
 
-        # Send Slack message(s)
-        for r in rows:
-            blocks = self.ui.notify_planned_blocks(keyword=r.keyword, planned_date=r.planned_date)
-            text = f"本日作成予定の記事があります：{r.keyword}"
-            await self._slack_post(channel=self.settings.slack_channel_id, text=text, blocks=blocks)
+        # Basic de-dupe by (keyword, date)
+        uniq: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for p in planned:
+            k = (str(p.get("keyword") or "").strip(), str(p.get("planned_date") or "").strip())
+            if k[0] and k[1]:
+                uniq[k] = p
+        planned = list(uniq.values())
 
-        return {"ok": True, "count": len(rows), "planned": planned}
+        # Optional: do not exceed daily max
+        if planned:
+            count = await anyio.to_thread.run_sync(self.repo.count_articles_for_date, ymd)
+            if count >= self.settings.daily_max_articles:
+                await self._slack_post(
+                    channel=self.settings.slack_channel_id,
+                    text=f"本日分の記事作成は上限（{self.settings.daily_max_articles}件）に達しています。通知をスキップします。",
+                    blocks=None,
+                )
+                return {"ok": True, "count": 0, "planned": []}
 
+        for p in planned:
+            blocks = self.ui.planned_item_blocks(keyword=p["keyword"], planned_date=p["planned_date"])
+            await self._slack_post(
+                channel=self.settings.slack_channel_id,
+                text=f"本日の記事予定: {p['keyword']} ({p['planned_date']})",
+                blocks=blocks,
+            )
+        return {"ok": True, "count": len(planned), "planned": planned}
+
+    # -------------------------
+    # Slack actions/events entrypoints
+    # -------------------------
     async def process_slack_action(self, action: Dict[str, Any]) -> None:
-        action_id: str = str(action.get("action_id") or "").strip()
-        channel_id: str = str(action.get("channel_id") or "").strip()
-        message_ts: str = str(action.get("message_ts") or "").strip()
+        """
+        Called from /slack/actions handler.
+        action is normalized:
+        { action_id, value, channel_id, message_ts }
+        """
+        action_id = (action.get("action_id") or "").strip()
+        value = (action.get("value") or "").strip()
+        channel_id = (action.get("channel_id") or "").strip()
+        message_ts = (action.get("message_ts") or "").strip()
 
-        raw_value = action.get("value")
-        value: Dict[str, Any] = {}
-        if isinstance(raw_value, str):
-            try:
-                value = json.loads(raw_value)
-            except Exception:
-                value = {}
-
-
-        if action_id == "ARTICLE_START":
-            keyword = str(value.get("keyword") or "").strip()
-            planned_date = normalize_ymd(str(value.get("planned_date") or "").strip())
-            if not keyword or not planned_date:
-                return
-            await self.start_article(channel_id=channel_id, keyword=keyword, planned_date=planned_date)
+        if action_id == "create_article":
+            keyword = value
+            planned_date = today_jst_ymd()
+            await self.start_article(keyword=keyword, planned_date=planned_date, slack_channel_id=channel_id)
             return
 
-        article_id = str(value.get("article_id") or "").strip()
+        if action_id == "skip_article":
+            await self._slack_post(channel=channel_id, text=f"スキップしました: {value}", blocks=None)
+            return
+
+        # Below: per-article actions (value contains article_id)
+        article_id = value
         if not article_id:
             return
 
-        if action_id == "OUTLINE_APPROVE":
+        if action_id == "approve_outline":
             await self.approve_outline(article_id=article_id)
             return
 
-        if action_id == "OUTLINE_REQUEST_REVISION":
+        if action_id == "revise_outline":
+            # message_ts is parent
             await self.request_outline_revision(article_id=article_id, parent_ts=message_ts)
             return
 
-        if action_id == "PAPER_SELECT":
-            pmid = str(value.get("pmid") or "").strip()
-            if pmid:
-                await self.select_paper(article_id=article_id, pmid=pmid)
-            return
-
-        if action_id == "PAPER_REQUEST_REVISION":
-            await self.request_paper_revision(article_id=article_id, parent_ts=message_ts)
-            return
-
-        if action_id == "BODY_APPROVE":
+        if action_id == "approve_body":
             await self.approve_body(article_id=article_id)
             return
 
-        if action_id == "BODY_REQUEST_REVISION":
+        if action_id == "revise_body":
             await self.request_body_revision(article_id=article_id, parent_ts=message_ts)
             return
 
-        if action_id == "FINAL_APPROVE":
+        if action_id.startswith("select_paper_"):
+            pmid = action_id.replace("select_paper_", "").strip()
+            await self.select_paper(article_id=article_id, pmid=pmid)
+            return
+
+        if action_id == "revise_paper":
+            await self.request_paper_revision(article_id=article_id, parent_ts=message_ts)
+            return
+
+        if action_id == "final_approve":
             await self.final_approve(article_id=article_id)
             return
 
-        if action_id == "FINAL_DISCARD":
+        if action_id == "final_discard":
             await self.final_discard(article_id=article_id)
             return
 
-        if action_id == "ARTICLE_PUBLISH":
+        if action_id == "confirm_publish":
             await self.confirm_publish(article_id=article_id)
             return
 
-        if action_id == "RETRY":
+        if action_id == "retry":
             await self.retry(article_id=article_id)
             return
 
     async def process_slack_thread_message(self, *, thread_ts: str, text: str) -> None:
+        """
+        Called when Slack message event is a thread reply.
+        We match thread_ts with slack_revision_thread_ts stored in state.
+        """
         thread_ts = (thread_ts or "").strip()
         if not thread_ts:
             return
@@ -157,43 +195,49 @@ class Services:
             await self.receive_body_feedback(article_id=state.article_id, feedback=feedback)
             return
 
-    async def start_article(self, *, channel_id: str, keyword: str, planned_date: str) -> None:
+    # -------------------------
+    # Workflow steps
+    # -------------------------
+    async def start_article(self, *, keyword: str, planned_date: str, slack_channel_id: str) -> None:
+        """
+        Create initial ArticleState.
+        Then trigger outline generation in background.
+        """
+        keyword = (keyword or "").strip()
+        planned_date = normalize_ymd(planned_date)
+        if not keyword or not planned_date:
+            return
+
+        # Snapshot in sheet is optional; can store in state
+        snapshot: Optional[Dict[str, Any]] = None
         try:
-            count = await anyio.to_thread.run_sync(self.repo.count_articles_for_date, planned_date)
-            article_id = generate_article_id(planned_date=planned_date, seq=count + 1)
-
             snapshot = await anyio.to_thread.run_sync(self.sheets.get_snapshot, keyword, planned_date)
+        except Exception:
+            snapshot = None
 
-            state = ArticleState(
-                article_id=article_id,
-                keyword=keyword,
-                planned_date=planned_date,
-                sheet_snapshot=snapshot,
-                phase=Phase.OUTLINE_GENERATING,
-                slack_channel_id=channel_id or self.settings.slack_channel_id,
-            )
-            await anyio.to_thread.run_sync(self.repo.create_article, state)
+        article_id = generate_article_id(keyword=keyword, planned_date=planned_date)
 
-            await self._slack_post(
-                channel=state.slack_channel_id,
-                text=f"記事作成を開始しました。article_id={article_id}",
-                blocks=None,
-            )
+        state = ArticleState(
+            article_id=article_id,
+            keyword=keyword,
+            planned_date=planned_date,
+            slack_channel_id=slack_channel_id,
+            phase=Phase.OUTLINE_GENERATING,
+            created_at=now_jst_iso(),
+            phase_updated_at=now_jst_iso(),
+            sheet_snapshot=snapshot,
+        )
 
-            # run outline generation async
-            import asyncio
-            # ARTICLE_START 直後
-            await self.generate_outline(article_id=article_id)
+        await anyio.to_thread.run_sync(self.repo.create_article, state)
 
+        await self._slack_post(
+            channel=slack_channel_id,
+            text=f"記事作成を開始しました。article_id={article_id}",
+            blocks=None,
+        )
 
-        except Exception as e:
-            logger.exception("start_article failed")
-            # if Firestore create fails, we have no article to bind error to; just notify
-            await self._slack_post(
-                channel=channel_id or self.settings.slack_channel_id,
-                text="エラーが発生しました。",
-                blocks=None,
-            )
+        import asyncio
+        asyncio.create_task(self.generate_outline(article_id=article_id))
 
     async def generate_outline(self, *, article_id: str) -> None:
         prev_phase = Phase.OUTLINE_GENERATING
@@ -237,10 +281,11 @@ class Services:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={"slack_revision_thread_ts": None},
-                set_phase=Phase.OUTLINE_CONFIRMED,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={"slack_revision_thread_ts": None},
+                    set_phase=Phase.OUTLINE_CONFIRMED,
+                )
             )
 
             await self._slack_post(
@@ -263,10 +308,11 @@ class Services:
             if state.outline_revision_count >= 3:
                 # go final review (approve/discard)
                 state = await anyio.to_thread.run_sync(
-                    self.repo.update_article_fields,
-                    article_id,
-                    updates={"slack_revision_thread_ts": None},
-                    set_phase=Phase.FINAL_REVIEW,
+                    lambda: self.repo.update_article_fields(
+                        article_id,
+                        updates={"slack_revision_thread_ts": None},
+                        set_phase=Phase.FINAL_REVIEW,
+                    )
                 )
                 blocks = self.ui.final_review_blocks(article_id=article_id)
                 await self._slack_post(
@@ -278,10 +324,11 @@ class Services:
 
             # store thread_ts and ask user to reply in thread
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={"slack_revision_thread_ts": parent_ts},
-                set_phase=Phase.OUTLINE_WAITING_FEEDBACK,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={"slack_revision_thread_ts": parent_ts},
+                    set_phase=Phase.OUTLINE_WAITING_FEEDBACK,
+                )
             )
 
             blocks = self.ui.request_revision_instruction_blocks(target="outline")
@@ -304,14 +351,15 @@ class Services:
             next_count = int(state.outline_revision_count) + 1
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={
-                    "outline_feedback_text": feedback,
-                    "outline_revision_count": next_count,
-                    "slack_revision_thread_ts": None,
-                },
-                set_phase=Phase.OUTLINE_GENERATING,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={
+                        "outline_feedback_text": feedback,
+                        "outline_revision_count": next_count,
+                        "slack_revision_thread_ts": None,
+                    },
+                    set_phase=Phase.OUTLINE_GENERATING,
+                )
             )
 
             await self._slack_post(
@@ -339,20 +387,23 @@ class Services:
                 state.paper_revision_count,
             )
 
-            papers = await anyio.to_thread.run_sync(self.pubmed.fetch_top_abstracts, query=query, retmax=3)
+            papers = await anyio.to_thread.run_sync(
+                lambda: self.pubmed.fetch_top_abstracts(query=query, retmax=3)
+            )
             candidates = [p.to_dict() for p in papers]
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={
-                    "pubmed_query": query,
-                    "paper_candidates": candidates,
-                    "paper_feedback_text": None,
-                    "selected_pmid": None,
-                    "slack_revision_thread_ts": None,
-                },
-                set_phase=Phase.PAPER_REVIEW,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={
+                        "pubmed_query": query,
+                        "paper_candidates": candidates,
+                        "paper_feedback_text": None,
+                        "selected_pmid": None,
+                        "slack_revision_thread_ts": None,
+                    },
+                    set_phase=Phase.PAPER_REVIEW,
+                )
             )
 
             blocks = self.ui.paper_review_blocks(article_id=article_id, keyword=state.keyword, candidates=candidates)
@@ -380,10 +431,11 @@ class Services:
                 return
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={"slack_revision_thread_ts": parent_ts},
-                set_phase=Phase.PAPER_WAITING_FEEDBACK,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={"slack_revision_thread_ts": parent_ts},
+                    set_phase=Phase.PAPER_WAITING_FEEDBACK,
+                )
             )
 
             blocks = self.ui.request_revision_instruction_blocks(target="paper")
@@ -403,15 +455,17 @@ class Services:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
             next_count = int(state.paper_revision_count) + 1
+
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={
-                    "paper_feedback_text": feedback,
-                    "paper_revision_count": next_count,
-                    "slack_revision_thread_ts": None,
-                },
-                set_phase=Phase.PAPER_SEARCHING,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={
+                        "paper_feedback_text": feedback,
+                        "paper_revision_count": next_count,
+                        "slack_revision_thread_ts": None,
+                    },
+                    set_phase=Phase.PAPER_SEARCHING,
+                )
             )
 
             await self._slack_post(
@@ -431,16 +485,26 @@ class Services:
         try:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
+            candidates = state.paper_candidates or []
+            selected = self._find_selected_candidate(candidates, pmid)
+            if selected is None:
+                raise ExternalApiError("PaperNotFound", f"pmid not found in candidates: {pmid}")
+
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={"selected_pmid": pmid, "slack_revision_thread_ts": None},
-                set_phase=Phase.PAPER_CONFIRMED,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={
+                        "selected_pmid": pmid,
+                        "selected_paper": selected,
+                        "slack_revision_thread_ts": None,
+                    },
+                    set_phase=Phase.BODY_GENERATING,
+                )
             )
 
             await self._slack_post(
                 channel=state.slack_channel_id,
-                text=f"論文を選択しました。PMID={pmid}。本文を生成します。",
+                text=f"論文を選択しました（PMID={pmid}）。本文を生成します。",
                 blocks=None,
             )
 
@@ -455,35 +519,38 @@ class Services:
         try:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
-            selected = self._find_selected_candidate(state.paper_candidates, state.selected_pmid)
-            if selected is None:
-                raise ExternalApiError("NoSelectedPaper", "selected paper not found")
+            selected = state.selected_paper
+            if not selected:
+                # best-effort: find from candidates by pmid
+                selected = self._find_selected_candidate(state.paper_candidates or [], state.selected_pmid)
+            if not selected:
+                raise ExternalApiError("NoSelectedPaper", "selected paper missing")
 
             body = await anyio.to_thread.run_sync(
                 self.openai.generate_body,
                 state.keyword,
                 state.outline_text or "",
                 selected,
-                state.body_text,
                 state.body_feedback_text,
                 state.body_revision_count,
             )
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={
-                    "body_text": body,
-                    "body_feedback_text": None,
-                    "slack_revision_thread_ts": None,
-                },
-                set_phase=Phase.BODY_REVIEW,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={
+                        "body_text": body,
+                        "body_feedback_text": None,
+                        "slack_revision_thread_ts": None,
+                    },
+                    set_phase=Phase.BODY_REVIEW,
+                )
             )
 
             blocks = self.ui.body_review_blocks(article_id=article_id, keyword=state.keyword, body_text=body)
             await self._slack_post(
                 channel=state.slack_channel_id,
-                text="本文を生成しました。承認または修正指示をお願いします。",
+                text="本文を作成しました。承認または修正指示をお願いします。",
                 blocks=blocks,
             )
 
@@ -496,16 +563,17 @@ class Services:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={},
-                set_phase=Phase.READY_TO_PUBLISH,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={"slack_revision_thread_ts": None},
+                    set_phase=Phase.READY_TO_PUBLISH,
+                )
             )
 
-            blocks = self.ui.ready_to_publish_blocks(article_id=article_id)
+            blocks = self.ui.publish_confirm_blocks(article_id=article_id)
             await self._slack_post(
                 channel=state.slack_channel_id,
-                text="最終確認です。投稿しますか？",
+                text="本文を承認しました。投稿しますか？",
                 blocks=blocks,
             )
 
@@ -518,11 +586,13 @@ class Services:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
             if state.body_revision_count >= 3:
+                # go final review
                 state = await anyio.to_thread.run_sync(
-                    self.repo.update_article_fields,
-                    article_id,
-                    updates={"slack_revision_thread_ts": None},
-                    set_phase=Phase.FINAL_REVIEW,
+                    lambda: self.repo.update_article_fields(
+                        article_id,
+                        updates={"slack_revision_thread_ts": None},
+                        set_phase=Phase.FINAL_REVIEW,
+                    )
                 )
                 blocks = self.ui.final_review_blocks(article_id=article_id)
                 await self._slack_post(
@@ -533,10 +603,11 @@ class Services:
                 return
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={"slack_revision_thread_ts": parent_ts},
-                set_phase=Phase.BODY_WAITING_FEEDBACK,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={"slack_revision_thread_ts": parent_ts},
+                    set_phase=Phase.BODY_WAITING_FEEDBACK,
+                )
             )
 
             blocks = self.ui.request_revision_instruction_blocks(target="body")
@@ -556,15 +627,17 @@ class Services:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
             next_count = int(state.body_revision_count) + 1
+
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={
-                    "body_feedback_text": feedback,
-                    "body_revision_count": next_count,
-                    "slack_revision_thread_ts": None,
-                },
-                set_phase=Phase.BODY_GENERATING,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={
+                        "body_feedback_text": feedback,
+                        "body_revision_count": next_count,
+                        "slack_revision_thread_ts": None,
+                    },
+                    set_phase=Phase.BODY_GENERATING,
+                )
             )
 
             await self._slack_post(
@@ -580,40 +653,81 @@ class Services:
             await self._handle_error(article_id=article_id, prev_phase=prev_phase, err=e)
 
     async def final_approve(self, *, article_id: str) -> None:
+        """
+        Final approve at FINAL_REVIEW:
+        - If outline exists and body exists -> move READY_TO_PUBLISH
+        - Else decide best next step based on available fields
+        """
         prev_phase = Phase.FINAL_REVIEW
         try:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
             if state.body_text:
-                # proceed to publish confirmation
+                # go publish
                 state = await anyio.to_thread.run_sync(
-                    self.repo.update_article_fields,
-                    article_id,
-                    updates={},
-                    set_phase=Phase.READY_TO_PUBLISH,
+                    lambda: self.repo.update_article_fields(
+                        article_id,
+                        updates={"slack_revision_thread_ts": None},
+                        set_phase=Phase.READY_TO_PUBLISH,
+                    )
                 )
-                blocks = self.ui.ready_to_publish_blocks(article_id=article_id)
+                blocks = self.ui.publish_confirm_blocks(article_id=article_id)
                 await self._slack_post(
                     channel=state.slack_channel_id,
-                    text="最終確認です。投稿しますか？",
+                    text="最終承認しました。投稿しますか？",
                     blocks=blocks,
                 )
                 return
 
-            # outline final approve: proceed with outline -> paper search
+            if state.selected_pmid:
+                state = await anyio.to_thread.run_sync(
+                    lambda: self.repo.update_article_fields(
+                        article_id,
+                        updates={"slack_revision_thread_ts": None},
+                        set_phase=Phase.BODY_GENERATING,
+                    )
+                )
+                await self._slack_post(
+                    channel=state.slack_channel_id,
+                    text="最終承認しました。本文を生成します。",
+                    blocks=None,
+                )
+                import asyncio
+                asyncio.create_task(self.generate_body(article_id=article_id))
+                return
+
+            if state.outline_text:
+                state = await anyio.to_thread.run_sync(
+                    lambda: self.repo.update_article_fields(
+                        article_id,
+                        updates={"slack_revision_thread_ts": None},
+                        set_phase=Phase.PAPER_SEARCHING,
+                    )
+                )
+                await self._slack_post(
+                    channel=state.slack_channel_id,
+                    text="最終承認しました。論文候補を取得します。",
+                    blocks=None,
+                )
+                import asyncio
+                asyncio.create_task(self.search_papers(article_id=article_id))
+                return
+
+            # fallback: outline generation
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={},
-                set_phase=Phase.OUTLINE_CONFIRMED,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={"slack_revision_thread_ts": None},
+                    set_phase=Phase.OUTLINE_GENERATING,
+                )
             )
             await self._slack_post(
                 channel=state.slack_channel_id,
-                text="承認しました。論文候補を取得します。",
+                text="最終承認しました。構成案を生成します。",
                 blocks=None,
             )
             import asyncio
-            asyncio.create_task(self.search_papers(article_id=article_id))
+            asyncio.create_task(self.generate_outline(article_id=article_id))
 
         except Exception as e:
             await self._handle_error(article_id=article_id, prev_phase=prev_phase, err=e)
@@ -624,17 +738,17 @@ class Services:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={},
-                set_phase=Phase.DISCARDED,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={"slack_revision_thread_ts": None},
+                    set_phase=Phase.DISCARDED,
+                )
             )
 
-            blocks = self.ui.discarded_blocks(article_id=article_id)
             await self._slack_post(
                 channel=state.slack_channel_id,
                 text="破棄しました。",
-                blocks=blocks,
+                blocks=None,
             )
 
         except Exception as e:
@@ -646,10 +760,11 @@ class Services:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={},
-                set_phase=Phase.PUBLISHING,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={},
+                    set_phase=Phase.PUBLISHING,
+                )
             )
 
             await self._slack_post(
@@ -670,15 +785,18 @@ class Services:
             state = await anyio.to_thread.run_sync(self.repo.get_article, article_id)
 
             # already published? detect by marker-search approach
-            existing = await anyio.to_thread.run_sync(self.wp.find_existing_by_article_id, article_id=article_id)
+            existing = await anyio.to_thread.run_sync(
+                lambda: self.wp.find_existing_by_article_id(article_id=article_id)
+            )
             if existing:
                 post_id = int(existing.get("id") or 0)
                 link = str(existing.get("link") or "")
                 state = await anyio.to_thread.run_sync(
-                    self.repo.update_article_fields,
-                    article_id,
-                    updates={"wp_post_id": post_id, "wp_post_url": link},
-                    set_phase=Phase.PUBLISHED,
+                    lambda: self.repo.update_article_fields(
+                        article_id,
+                        updates={"wp_post_id": post_id, "wp_post_url": link},
+                        set_phase=Phase.PUBLISHED,
+                    )
                 )
                 blocks = self.ui.published_blocks(article_id=article_id, url=link)
                 await self._slack_post(
@@ -708,33 +826,36 @@ class Services:
             )
 
             cat_ids, tag_ids = await anyio.to_thread.run_sync(
-                self.wp.ensure_terms,
-                categories=categories,
-                tags=tags,
+                lambda: self.wp.ensure_terms(
+                    categories=categories,
+                    tags=tags,
+                )
             )
 
             post_id, url = await anyio.to_thread.run_sync(
-                self.wp.publish_post,
-                title=title,
-                slug=slug,
-                content=state.body_text or "",
-                category_ids=cat_ids,
-                tag_ids=tag_ids,
-                article_id=article_id,
+                lambda: self.wp.publish_post(
+                    title=title,
+                    slug=slug,
+                    content=state.body_text or "",
+                    category_ids=cat_ids,
+                    tag_ids=tag_ids,
+                    article_id=article_id,
+                )
             )
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={
-                    "wp_post_id": post_id,
-                    "wp_post_url": url,
-                    "wp_title": title,
-                    "wp_slug": slug,
-                    "wp_categories": categories,
-                    "wp_tags": tags,
-                },
-                set_phase=Phase.PUBLISHED,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={
+                        "wp_post_id": post_id,
+                        "wp_post_url": url,
+                        "wp_title": title,
+                        "wp_slug": slug,
+                        "wp_categories": categories,
+                        "wp_tags": tags,
+                    },
+                    set_phase=Phase.PUBLISHED,
+                )
             )
 
             blocks = self.ui.published_blocks(article_id=article_id, url=url)
@@ -780,10 +901,11 @@ class Services:
                 target_phase = Phase.OUTLINE_GENERATING
 
             state = await anyio.to_thread.run_sync(
-                self.repo.update_article_fields,
-                article_id,
-                updates={},
-                set_phase=target_phase,
+                lambda: self.repo.update_article_fields(
+                    article_id,
+                    updates={},
+                    set_phase=target_phase,
+                )
             )
 
             # trigger corresponding work (revision_count unchanged)
@@ -831,10 +953,11 @@ class Services:
         if state is not None:
             try:
                 state = await anyio.to_thread.run_sync(
-                    self.repo.update_article_fields,
-                    article_id,
-                    updates=patch,
-                    set_phase=Phase.ERROR,
+                    lambda: self.repo.update_article_fields(
+                        article_id,
+                        updates=patch,
+                        set_phase=Phase.ERROR,
+                    )
                 )
             except Exception:
                 pass
@@ -891,8 +1014,6 @@ class Services:
             return self.slack.post_message(**kwargs)
 
         await anyio.to_thread.run_sync(_post)
-
-
 
     def _find_selected_candidate(self, candidates: List[Dict[str, Any]], pmid: Optional[str]) -> Optional[Dict[str, Any]]:
         if not pmid:

@@ -40,7 +40,7 @@ class Settings:
     wp_app_password: str
     wp_post_type: str
 
-    daily_max_articles: int = 3
+    daily_max_articles: int
 
 _settings: Optional[Settings] = None
 
@@ -89,5 +89,7 @@ def get_settings() -> Settings:
         wp_username=env("WP_USERNAME"),
         wp_app_password=env("WP_APP_PASSWORD"),
         wp_post_type=env("WP_POST_TYPE", "posts"),
+
+        daily_max_articles=int(env("DAILY_MAX_ARTICLES", "3")),
     )
     return _settings

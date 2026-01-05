@@ -47,7 +47,7 @@ class Services:
         self.sheets = SheetsClient(settings)
 
         self.slack = SlackClient(settings)
-        self.ui = SlackUI(settings)
+        self.ui = SlackUI()
 
         self.openai = OpenAIClient(settings)
         self.pubmed = PubMedClient(settings)

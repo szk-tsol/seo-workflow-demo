@@ -40,6 +40,7 @@ class Settings:
     wp_app_password: str
     wp_post_type: str
 
+    daily_max_articles: int = 3
 
 _settings: Optional[Settings] = None
 

@@ -14,6 +14,7 @@ from app.integrations.slack.security import verify_slack_signature
 from app.integrations.slack.handlers import handle_slack_actions, handle_slack_events
 from app.services import Services
 from app.utils.logger import init_logging, get_logger
+from urllib.parse import parse_qs
 
 load_dotenv()
 init_logging()
@@ -67,23 +68,21 @@ async def slack_events(request: Request):
         )
     return JSONResponse({"ok": True})
 
-
 @app.post("/slack/actions")
 async def slack_actions(request: Request):
     body = await request.body()
     _verify_slack_request(request, body)
 
-    form = await request.form()
-    payload_raw = form.get("payload")
+    # Slack は application/x-www-form-urlencoded
+    decoded = body.decode("utf-8")
+    parsed = parse_qs(decoded)
+
+    payload_raw = parsed.get("payload", [None])[0]
     if not payload_raw:
         raise HTTPException(status_code=400, detail="missing payload")
 
-    try:
-        payload = json.loads(str(payload_raw))
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid payload json")
+    payload = json.loads(payload_raw)
 
-    # Ack immediately; process async
     action = payload["actions"][0]
 
     normalized_action = {

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import asyncio
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 import json
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 
@@ -46,9 +45,8 @@ async def health() -> Dict[str, Any]:
 async def root() -> Dict[str, Any]:
     return {"message": "seo-workflow"}
 
-
 @app.post("/slack/events")
-async def slack_events(request: Request):
+async def slack_events(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     _verify_slack_request(request, body)
 
@@ -57,23 +55,27 @@ async def slack_events(request: Request):
     if payload.get("type") == "url_verification":
         return PlainTextResponse(str(payload.get("challenge") or ""), status_code=200)
 
-    # Ack immediately; process async
     event = payload.get("event", {})
     if event.get("type") == "message" and event.get("thread_ts"):
-        asyncio.create_task(
-            get_services().process_slack_thread_message(
-                thread_ts=event["thread_ts"],
-                text=event.get("text", "")
-            )
-        )
+        thread_ts = event["thread_ts"]
+        text = event.get("text", "") or ""
+
+        background_tasks.add_task(_safe_process_slack_thread_message, thread_ts, text)
+
     return JSONResponse({"ok": True})
 
+
+async def _safe_process_slack_thread_message(thread_ts: str, text: str) -> None:
+    try:
+        await get_services().process_slack_thread_message(thread_ts=thread_ts, text=text)
+    except Exception:
+        logger.exception("process_slack_thread_message failed", extra={"thread_ts": thread_ts})
+
 @app.post("/slack/actions")
-async def slack_actions(request: Request):
+async def slack_actions(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     _verify_slack_request(request, body)
 
-    # Slack は application/x-www-form-urlencoded
     decoded = body.decode("utf-8")
     parsed = parse_qs(decoded)
 
@@ -82,7 +84,6 @@ async def slack_actions(request: Request):
         raise HTTPException(status_code=400, detail="missing payload")
 
     payload = json.loads(payload_raw)
-
     action = payload["actions"][0]
 
     normalized_action = {
@@ -92,11 +93,17 @@ async def slack_actions(request: Request):
         "message_ts": payload.get("message", {}).get("ts"),
     }
 
-    asyncio.create_task(
-        get_services().process_slack_action(normalized_action)
-    )
+    background_tasks.add_task(_safe_process_slack_action, normalized_action)
 
     return JSONResponse({"ok": True})
+
+
+async def _safe_process_slack_action(action: Dict[str, Any]) -> None:
+    try:
+        await get_services().process_slack_action(action)
+    except Exception:
+        logger.exception("process_slack_action failed", extra={"action": action})
+
 
 
 @app.post("/jobs/notify_planned")

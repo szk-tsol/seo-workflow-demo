@@ -240,8 +240,8 @@ class Services:
             blocks=None,
         )
 
-        import asyncio
-        asyncio.create_task(self.generate_outline(article_id=article_id))
+        await self.generate_outline(article_id=article_id)
+
 
     async def generate_outline(self, *, article_id: str) -> None:
         prev_phase = Phase.OUTLINE_GENERATING
@@ -298,8 +298,8 @@ class Services:
                 blocks=None,
             )
 
-            import asyncio
-            asyncio.create_task(self.search_papers(article_id=article_id))
+            await self.search_papers(article_id=article_id)
+
 
         except Exception as e:
             await self._handle_error(article_id=article_id, prev_phase=prev_phase, err=e)
@@ -372,8 +372,8 @@ class Services:
                 blocks=None,
             )
 
-            import asyncio
-            asyncio.create_task(self.generate_outline(article_id=article_id))
+            await self.generate_outline(article_id=article_id)
+
 
         except Exception as e:
             await self._handle_error(article_id=article_id, prev_phase=prev_phase, err=e)
@@ -478,8 +478,8 @@ class Services:
                 blocks=None,
             )
 
-            import asyncio
-            asyncio.create_task(self.search_papers(article_id=article_id))
+            await self.search_papers(article_id=article_id)
+
 
         except Exception as e:
             await self._handle_error(article_id=article_id, prev_phase=prev_phase, err=e)
@@ -512,8 +512,8 @@ class Services:
                 blocks=None,
             )
 
-            import asyncio
-            asyncio.create_task(self.generate_body(article_id=article_id))
+            await self.generate_body(article_id=article_id)
+
 
         except Exception as e:
             await self._handle_error(article_id=article_id, prev_phase=prev_phase, err=e)
@@ -650,8 +650,8 @@ class Services:
                 blocks=None,
             )
 
-            import asyncio
-            asyncio.create_task(self.generate_body(article_id=article_id))
+            await self.generate_body(article_id=article_id)
+
 
         except Exception as e:
             await self._handle_error(article_id=article_id, prev_phase=prev_phase, err=e)
@@ -696,8 +696,7 @@ class Services:
                     text="最終承認しました。本文を生成します。",
                     blocks=None,
                 )
-                import asyncio
-                asyncio.create_task(self.generate_body(article_id=article_id))
+                await self.generate_body(article_id=article_id)
                 return
 
             if state.outline_text:
@@ -777,8 +776,8 @@ class Services:
                 blocks=None,
             )
 
-            import asyncio
-            asyncio.create_task(self.publish_article(article_id=article_id))
+            await self.publish_article(article_id=article_id)
+
 
         except Exception as e:
             await self._handle_error(article_id=article_id, prev_phase=prev_phase, err=e)
@@ -913,25 +912,24 @@ class Services:
             )
 
             # trigger corresponding work (revision_count unchanged)
-            import asyncio
             if target_phase in (Phase.OUTLINE_GENERATING,):
-                asyncio.create_task(self.generate_outline(article_id=article_id))
+                await self.generate_outline(article_id=article_id)
             elif target_phase in (Phase.PAPER_SEARCHING,):
-                asyncio.create_task(self.search_papers(article_id=article_id))
+                await self.search_papers(article_id=article_id)
             elif target_phase in (Phase.BODY_GENERATING,):
-                asyncio.create_task(self.generate_body(article_id=article_id))
+                await self.generate_body(article_id=article_id)
             elif target_phase in (Phase.PUBLISHING,):
-                asyncio.create_task(self.publish_article(article_id=article_id))
+                await self.publish_article(article_id=article_id)
             else:
-                # fallback: try to resume by phase
                 if state.body_text:
-                    asyncio.create_task(self.publish_article(article_id=article_id))
+                    await self.publish_article(article_id=article_id)
                 elif state.selected_pmid:
-                    asyncio.create_task(self.generate_body(article_id=article_id))
+                    await self.generate_body(article_id=article_id)
                 elif state.outline_text:
-                    asyncio.create_task(self.search_papers(article_id=article_id))
+                    await self.search_papers(article_id=article_id)
                 else:
-                    asyncio.create_task(self.generate_outline(article_id=article_id))
+                    await self.generate_outline(article_id=article_id)
+
 
         except Exception as e:
             await self._handle_error(article_id=article_id, prev_phase=prev_phase, err=e)

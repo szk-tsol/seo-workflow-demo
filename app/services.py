@@ -635,7 +635,7 @@ class Services:
                 )
             )
 
-            blocks = self.ui.publish_confirm_blocks(article_id=article_id)
+            blocks = self.ui.ready_to_publish_blocks(article_id=article_id)
             await self._slack_post(
                 channel=state.slack_channel_id,
                 text="本文を承認しました。投稿しますか？",
@@ -736,7 +736,7 @@ class Services:
                         set_phase=Phase.READY_TO_PUBLISH,
                     )
                 )
-                blocks = self.ui.publish_confirm_blocks(article_id=article_id)
+                blocks = self.ui.ready_to_publish_blocks(article_id=article_id)
                 await self._slack_post(
                     channel=state.slack_channel_id,
                     text="最終承認しました。投稿しますか？",

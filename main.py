@@ -74,28 +74,48 @@ async def _safe_process_slack_thread_message(thread_ts: str, text: str) -> None:
 @app.post("/slack/actions")
 async def slack_actions(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
-    _verify_slack_request(request, body)
+
+    maybe_resp = _verify_slack_request(request, body)
+    if maybe_resp is not None:
+        return maybe_resp
 
     decoded = body.decode("utf-8")
     parsed = parse_qs(decoded)
 
     payload_raw = parsed.get("payload", [None])[0]
     if not payload_raw:
+        logger.warning("slack/actions missing payload")
         raise HTTPException(status_code=400, detail="missing payload")
 
     payload = json.loads(payload_raw)
-    action = payload["actions"][0]
+
+    actions = payload.get("actions") or []
+    if not actions:
+        logger.warning("slack/actions no actions in payload")
+        return JSONResponse({"ok": True})
+
+    action = actions[0]
 
     normalized_action = {
         "action_id": action.get("action_id"),
         "value": action.get("value"),
-        "channel_id": payload.get("channel", {}).get("id"),
-        "message_ts": payload.get("message", {}).get("ts"),
+        "channel_id": (payload.get("channel") or {}).get("id"),
+        "message_ts": (payload.get("message") or {}).get("ts"),
     }
+
+    logger.info(
+        "slack/actions received",
+        extra={
+            "action_id": normalized_action.get("action_id"),
+            "channel_id": normalized_action.get("channel_id"),
+            "message_ts": normalized_action.get("message_ts"),
+        },
+    )
 
     background_tasks.add_task(_safe_process_slack_action, normalized_action)
 
     return JSONResponse({"ok": True})
+
 
 
 async def _safe_process_slack_action(action: Dict[str, Any]) -> None:
@@ -120,10 +140,18 @@ def _verify_jobs_token(request: Request) -> None:
     if not token or token != settings.jobs_token:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-
-def _verify_slack_request(request: Request, body: bytes) -> None:
+def _verify_slack_request(request: Request, body: bytes):
+    # Slack retry は “普通に 200 を返して終了” が安全
     if request.headers.get("X-Slack-Retry-Num"):
-        raise HTTPException(status_code=200, detail="retry ignored")
+        logger.info(
+            "slack retry ignored",
+            extra={
+                "retry_num": request.headers.get("X-Slack-Retry-Num"),
+                "retry_reason": request.headers.get("X-Slack-Retry-Reason"),
+            },
+        )
+        return JSONResponse({"ok": True, "retry_ignored": True})
+
     timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
     signature = request.headers.get("X-Slack-Signature", "")
     try:
@@ -134,4 +162,7 @@ def _verify_slack_request(request: Request, body: bytes) -> None:
             body=body,
         )
     except Exception as e:
+        logger.warning("invalid slack signature", extra={"error": str(e)})
         raise HTTPException(status_code=401, detail=f"invalid slack signature: {e}")
+
+    return None

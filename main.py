@@ -96,12 +96,20 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
 
     action = actions[0]
 
+    # 追加：static_select の場合は selected_option.value を使う
+    if action.get("type") == "static_select":
+        sel = action.get("selected_option") or {}
+        raw_value = sel.get("value")
+    else:
+        raw_value = action.get("value")
+
     normalized_action = {
         "action_id": action.get("action_id"),
-        "value": action.get("value"),
+        "value": raw_value,
         "channel_id": (payload.get("channel") or {}).get("id"),
         "message_ts": (payload.get("message") or {}).get("ts"),
     }
+
 
     logger.info(
         "slack/actions received",
@@ -112,9 +120,9 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
         },
     )
 
-    background_tasks.add_task(_safe_process_slack_action, normalized_action)
-
+    await _safe_process_slack_action(normalized_action)
     return JSONResponse({"ok": True})
+
 
 
 

@@ -5,7 +5,8 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import anyio
-
+from app.domain import ArticleState, Phase, SlackAction
+from app.utils.jsonutil import safe_json_loads
 from app.config import Settings
 from app.domain import ArticleState, Phase
 from app.integrations.openai_client import OpenAIClient
@@ -52,6 +53,22 @@ class Services:
         self.openai = OpenAIClient(settings)
         self.pubmed = PubMedClient(settings)
         self.wp = WordPressClient(settings)
+
+    def _parse_action_value(self, raw: str) -> Dict[str, Any]:
+        s = (raw or "").strip()
+        if not s:
+            return {}
+
+        try:
+            obj = safe_json_loads(s)
+        except Exception:
+            return {"raw": s}
+
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, str) and obj.strip():
+            return {"raw": obj.strip()}
+        return {"raw": s}
 
     # -------------------------
     # Cron/Jobs entrypoint
@@ -103,72 +120,109 @@ class Services:
     # Slack actions/events entrypoints
     # -------------------------
     async def process_slack_action(self, action: Dict[str, Any]) -> None:
-        """
-        Called from /slack/actions handler.
-        action is normalized:
-        { action_id, value, channel_id, message_ts }
-        """
         action_id = (action.get("action_id") or "").strip()
-        value = (action.get("value") or "").strip()
+        value_raw = (action.get("value") or "").strip()
         channel_id = (action.get("channel_id") or "").strip()
         message_ts = (action.get("message_ts") or "").strip()
 
-        if action_id == "create_article":
-            keyword = value
-            planned_date = today_jst_ymd()
-            await self.start_article(keyword=keyword, planned_date=planned_date, slack_channel_id=channel_id)
+        if not action_id:
             return
 
-        if action_id == "skip_article":
-            await self._slack_post(channel=channel_id, text=f"スキップしました: {value}", blocks=None)
+        v = self._parse_action_value(value_raw)
+
+        # よく使う取り出し
+        keyword = (v.get("keyword") or v.get("raw") or "").strip()
+        planned_date = (v.get("planned_date") or "").strip()
+        article_id = (v.get("article_id") or v.get("raw") or "").strip()
+        pmid = (v.get("pmid") or "").strip()
+
+        # 1) 記事開始（UI: ARTICLE_START / 旧: create_article）
+        if action_id in (SlackAction.ARTICLE_START.value, "create_article"):
+            if not planned_date:
+                planned_date = today_jst_ymd()
+            await self.start_article(
+                keyword=keyword,
+                planned_date=planned_date,
+                slack_channel_id=channel_id,
+            )
             return
 
-        # Below: per-article actions (value contains article_id)
-        article_id = value
-        if not article_id:
+        # 2) 構成案 承認/修正
+        if action_id in (SlackAction.OUTLINE_APPROVE.value, "approve_outline"):
+            if article_id:
+                await self.approve_outline(article_id=article_id)
             return
 
-        if action_id == "approve_outline":
-            await self.approve_outline(article_id=article_id)
+        if action_id in (SlackAction.OUTLINE_REQUEST_REVISION.value, "revise_outline"):
+            if article_id:
+                await self.request_outline_revision(
+                    article_id=article_id,
+                    parent_ts=message_ts,
+                )
             return
 
-        if action_id == "revise_outline":
-            # message_ts is parent
-            await self.request_outline_revision(article_id=article_id, parent_ts=message_ts)
+        # 3) 論文選択（UI: PAPER_SELECT）
+        if action_id == SlackAction.PAPER_SELECT.value:
+            if article_id and pmid:
+                await self.select_paper(article_id=article_id, pmid=pmid)
             return
 
-        if action_id == "approve_body":
-            await self.approve_body(article_id=article_id)
+        if action_id in (SlackAction.PAPER_REQUEST_REVISION.value, "revise_paper"):
+            if article_id:
+                await self.request_paper_revision(
+                    article_id=article_id,
+                    parent_ts=message_ts,
+                )
             return
 
-        if action_id == "revise_body":
-            await self.request_body_revision(article_id=article_id, parent_ts=message_ts)
+        # 4) 本文 承認/修正
+        if action_id in (SlackAction.BODY_APPROVE.value, "approve_body"):
+            if article_id:
+                await self.approve_body(article_id=article_id)
             return
 
+        if action_id in (SlackAction.BODY_REQUEST_REVISION.value, "revise_body"):
+            if article_id:
+                await self.request_body_revision(
+                    article_id=article_id,
+                    parent_ts=message_ts,
+                )
+            return
+
+        # 5) 最終 承認/破棄
+        if action_id in (SlackAction.FINAL_APPROVE.value, "final_approve"):
+            if article_id:
+                await self.final_approve(article_id=article_id)
+            return
+
+        if action_id in (SlackAction.FINAL_DISCARD.value, "final_discard"):
+            if article_id:
+                await self.final_discard(article_id=article_id)
+            return
+
+        # 6) 投稿（UI: ARTICLE_PUBLISH / 旧: confirm_publish）
+        if action_id in (SlackAction.ARTICLE_PUBLISH.value, "confirm_publish"):
+            if article_id:
+                await self.confirm_publish(article_id=article_id)
+            return
+
+        # 7) リトライ
+        if action_id in (SlackAction.RETRY.value, "retry"):
+            if article_id:
+                await self.retry(article_id=article_id)
+            return
+
+        # 8) 旧方式（select_paper_XXXX）互換
         if action_id.startswith("select_paper_"):
-            pmid = action_id.replace("select_paper_", "").strip()
-            await self.select_paper(article_id=article_id, pmid=pmid)
+            pmid2 = action_id.replace("select_paper_", "").strip()
+            if article_id and pmid2:
+                await self.select_paper(article_id=article_id, pmid=pmid2)
             return
 
-        if action_id == "revise_paper":
-            await self.request_paper_revision(article_id=article_id, parent_ts=message_ts)
-            return
-
-        if action_id == "final_approve":
-            await self.final_approve(article_id=article_id)
-            return
-
-        if action_id == "final_discard":
-            await self.final_discard(article_id=article_id)
-            return
-
-        if action_id == "confirm_publish":
-            await self.confirm_publish(article_id=article_id)
-            return
-
-        if action_id == "retry":
-            await self.retry(article_id=article_id)
-            return
+        logger.info(
+            "unknown slack action ignored",
+            extra={"action_id": action_id, "value": value_raw},
+        )
 
     async def process_slack_thread_message(self, *, thread_ts: str, text: str) -> None:
         """

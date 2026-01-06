@@ -77,6 +77,7 @@ class ArticleState:
     selected_pmid: Optional[str] = None
     paper_feedback_text: Optional[str] = None
     paper_revision_count: int = 0
+    selected_paper: Optional[dict] = None
 
     # Body
     body_text: Optional[str] = None

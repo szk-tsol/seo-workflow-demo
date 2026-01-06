@@ -273,7 +273,11 @@ class Services:
         except Exception:
             snapshot = None
 
-        article_id = generate_article_id(keyword, planned_date)
+        article_id = generate_article_id(
+            planned_date=planned_date,
+            seq=1,
+        )
+
 
         state = ArticleState(
             article_id=article_id,

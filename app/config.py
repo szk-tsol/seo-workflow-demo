@@ -90,6 +90,6 @@ def get_settings() -> Settings:
         wp_app_password=env("WP_APP_PASSWORD"),
         wp_post_type=env("WP_POST_TYPE", "posts"),
 
-        daily_max_articles=int(env("DAILY_MAX_ARTICLES", "3")),
+        daily_max_articles=int(env("DAILY_MAX_ARTICLES", "20")),
     )
     return _settings

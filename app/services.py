@@ -87,7 +87,11 @@ class Services:
                 return {"ok": True, "count": 0, "planned": []}
 
         for p in planned:
-            blocks = self.ui.planned_item_blocks(keyword=p["keyword"], planned_date=p["planned_date"])
+            # notify_planned() 内
+            blocks = self.ui.notify_planned_blocks(
+                keyword=p["keyword"],
+                planned_date=p["planned_date"]
+            )
             await self._slack_post(
                 channel=self.settings.slack_channel_id,
                 text=f"本日の記事予定: {p['keyword']} ({p['planned_date']})",

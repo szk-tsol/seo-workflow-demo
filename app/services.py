@@ -589,14 +589,16 @@ class Services:
                 raise ExternalApiError("NoSelectedPaper", "selected paper missing")
 
             body = await anyio.to_thread.run_sync(
-            lambda: self.openai.generate_body(
-            keyword=state.keyword,
-            outline_text=state.outline_text or "",
-            selected=selected,
-            feedback_text=state.body_feedback_text,
-            revision_count=state.body_revision_count,
+                lambda: self.openai.generate_body(
+                    keyword=state.keyword,
+                    outline_text=state.outline_text or "",
+                    selected_paper=selected,
+                    prev_body=state.body_text or "",
+                    feedback=state.body_feedback_text,
+                    revision_count=state.body_revision_count,
+                )
             )
-            )
+
 
             state = await anyio.to_thread.run_sync(
                 lambda: self.repo.update_article_fields(
